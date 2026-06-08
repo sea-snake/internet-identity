@@ -357,20 +357,19 @@ Folding the failure marker into the same map (a cold-failed key is `value: None`
 ```mermaid
 stateDiagram-v2
     [*] --> Absent
-    Absent --> Filling: lookup • cold miss<br/>(all concurrent callers wait)
+    Absent --> Filling: cold miss, callers wait
     Filling --> Fresh: fill ok
-    Filling --> CoolingDown: fill err • no value to serve
-    Fresh --> Stale: now ≥ fresh_until
-    Stale --> Refilling: lookup • throttle elapsed<br/>(keep old value; callers wait)
-    Stale --> Stale: lookup • throttle not elapsed<br/>(serve old value, no fill)
-    Refilling --> Fresh: refill ok • replace value
-    Refilling --> Stale: refill err • keep old value, bump throttle
-    CoolingDown --> Filling: throttle elapsed • retry
-    Stale --> Absent: now ≥ evict_at • evicted
-    CoolingDown --> Absent: now ≥ evict_at • evicted
+    Filling --> CoolingDown: fill err, no value
+    Fresh --> Stale: now past fresh_until
+    Stale --> Refilling: throttle elapsed, keep old, callers wait
+    Stale --> Stale: throttle pending, serve old
+    Refilling --> Fresh: refill ok, replace value
+    Refilling --> Stale: refill err, keep old, bump throttle
+    CoolingDown --> Filling: throttle elapsed, retry
+    Stale --> Absent: now past evict_at, evicted
+    CoolingDown --> Absent: now past evict_at, evicted
     note right of Absent
-        Over max_entries, the oldest
-        entry is evicted here too.
+        Over max_entries, the oldest entry is evicted here too.
     end note
 ```
 
@@ -384,22 +383,23 @@ sequenceDiagram
     participant IdP
     Note over Cache: key is STALE (old value present, throttle elapsed)
     A->>Cache: get_or_fill(key)
-    Cache-->>A: Cold(token) — A drives the refill, old value retained
+    Cache-->>A: Cold(token), A drives the refill, old value kept
     B->>Cache: get_or_fill(key)
-    Cache-->>B: Pending — waits on A's refill (no 2nd outcall)
+    Cache-->>B: Pending, waits on A's refill (no 2nd outcall)
     A->>IdP: fetch
     alt refill succeeds
         IdP-->>A: fresh value
-        A->>Cache: publish Ok → store fresh, clear in-flight
+        A->>Cache: publish Ok, store fresh, clear in-flight
         Cache-->>A: FRESH value
         Cache-->>B: FRESH value (re-check sees Fresh)
     else refill fails
         IdP-->>A: error
-        A->>Cache: publish Err → keep old value, set next_attempt, clear in-flight
+        A->>Cache: publish Err, keep old value and set throttle
         Cache-->>A: STALE value
         Cache-->>B: STALE value (re-check sees Stale)
     end
-    Note over Cache: a later caller within the throttle → STALE (no fill);<br/>after the throttle → drives a new refill
+    Note over Cache: later caller within throttle gets STALE, no fill
+    Note over Cache: after throttle, a caller drives a new refill
 ```
 
 **The windows on a timeline** (example values — real `ttl`/`stale` are per-cache config):
