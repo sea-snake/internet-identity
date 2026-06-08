@@ -357,21 +357,23 @@ Folding the failure marker into the same map (a cold-failed key is `value: None`
 ```mermaid
 stateDiagram-v2
     [*] --> Absent
-    Absent --> Filling: cold miss, callers wait
-    Filling --> Fresh: fill ok
-    Filling --> CoolingDown: fill err, no value
-    Fresh --> Stale: now past fresh_until
-    Stale --> Refilling: throttle elapsed, keep old, callers wait
-    Stale --> Stale: throttle pending, serve old
-    Refilling --> Fresh: refill ok, replace value
-    Refilling --> Stale: refill err, keep old, bump throttle
-    CoolingDown --> Filling: throttle elapsed, retry
-    Stale --> Absent: now past evict_at, evicted
-    CoolingDown --> Absent: now past evict_at, evicted
+    Absent --> Filling: cold miss
+    Filling --> Fresh: ok
+    Filling --> CoolingDown: error
+    Fresh --> Stale: ttl elapsed
+    Stale --> Refilling: refresh due
+    Stale --> Stale: not due
+    Refilling --> Fresh: ok
+    Refilling --> Stale: error
+    CoolingDown --> Filling: retry due
+    Stale --> Absent: evict_at
+    CoolingDown --> Absent: evict_at
     note right of Absent
         Over max_entries, the oldest entry is evicted here too.
     end note
 ```
+
+States that serve a value: **Fresh** (fresh) and **Stale** (last good value). In-flight fills: **Filling** (cold, nothing to serve yet) and **Refilling** (stale value still served to waiters). Serve nothing: **CoolingDown** and **Absent**. Edge labels are the trigger only — the per-state behaviour (serve old, keep old, replace, throttle) is in the resolution table below.
 
 **Concurrency + stale-if-error**, the property we care about most: once a refill is in flight, every concurrent caller waits and they all converge on one value — fresh if the refill succeeds, the same stale value if it fails. No caller ever sees a different value than its neighbours, and an error only surfaces for a key with **no** servable value at all.
 
