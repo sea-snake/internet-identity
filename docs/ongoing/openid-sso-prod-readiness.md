@@ -324,6 +324,117 @@ sequenceDiagram
 
 The `cache.jwks` lookup that follows step 2 of every flow above is identical in shape — keyed by `jwks_uri` instead of `discovery_domain`.
 
+#### 5.2.2 Generic cache primitive (`single_flight_cache`)
+
+Both `cache.discovery` and `cache.jwks` are instances of **one** generic primitive, `SingleFlightCache<K, V>` (the `single_flight_cache` module extracted in dfinity/internet-identity#3995), so dedup, TTL, stale-serving and eviction live in one tested place. This refines the sketch in §5.2 in two ways:
+
+- **Dedup is poll-based, not `Waker`-backed.** A waiter re-checks the cache from its **own** call context between cheap management-canister yields (`raw_rand`). On the single-threaded IC executor, waking another call's task runs it to completion *inside the filler's* call context and mis-routes the reply (`ic0.msg_reply … already replied`); polling from your own context avoids that. The cache holds no `Waker`s and no shared futures.
+- **Entries are served stale-while-revalidate / stale-if-error**, not hard-evicted at TTL. A failed refresh keeps serving the last good value instead of falling back to an error.
+
+Terminology bridge to §5.2: `Hit` → **Fresh**, `Fetch` → **Cold**, `Wait` → **Pending**; plus two new states, **Stale** and **CoolingDown**.
+
+**Two time knobs per cache, plus a size cap:**
+
+- `ttl` — how long a freshly filled value is **Fresh** (served with no fill).
+- `stale` — extra time the last good value is still served (**Stale**) after `ttl`, while refreshes are attempted on demand. An entry's lifetime is `ttl + stale`; it is hard-evicted at `evict_at = last_success + ttl + stale`.
+- `max_entries` — hard cap on entries. Over it, an entry is evicted to make room: **newer data wins**.
+
+Conceptually one record per key:
+
+```rust
+struct Entry<V> {
+    value: Option<V>,   // Some after a success; None = a cold key that only ever failed
+    fresh_until: u64,   // Fresh while now < fresh_until
+    evict_at:    u64,   // hard DEAD line = last_success + ttl + stale
+    next_attempt: u64,  // failure throttle: earliest a (re)fill may run
+}
+```
+
+Folding the failure marker into the same map (a cold-failed key is `value: None`) means `max_entries` bounds value entries **and** failure markers together — there is no separate unbounded cooldown map.
+
+**The entry lifecycle** — note that a refill in flight is uniform: *all* concurrent callers wait on it and receive the *same* resolution (this is the existing single-flight dedup; it is never bypassed):
+
+```mermaid
+stateDiagram-v2
+    [*] --> Absent
+    Absent --> Filling: lookup • cold miss<br/>(all concurrent callers wait)
+    Filling --> Fresh: fill ok
+    Filling --> CoolingDown: fill err • no value to serve
+    Fresh --> Stale: now ≥ fresh_until
+    Stale --> Refilling: lookup • throttle elapsed<br/>(keep old value; callers wait)
+    Stale --> Stale: lookup • throttle not elapsed<br/>(serve old value, no fill)
+    Refilling --> Fresh: refill ok • replace value
+    Refilling --> Stale: refill err • keep old value, bump throttle
+    CoolingDown --> Filling: throttle elapsed • retry
+    Stale --> Absent: now ≥ evict_at • evicted
+    CoolingDown --> Absent: now ≥ evict_at • evicted
+    note right of Absent
+        Over max_entries, the oldest
+        entry is evicted here too.
+    end note
+```
+
+**Concurrency + stale-if-error**, the property we care about most: once a refill is in flight, every concurrent caller waits and they all converge on one value — fresh if the refill succeeds, the same stale value if it fails. No caller ever sees a different value than its neighbours, and an error only surfaces for a key with **no** servable value at all.
+
+```mermaid
+sequenceDiagram
+    actor A
+    actor B
+    participant Cache as SingleFlightCache
+    participant IdP
+    Note over Cache: key is STALE (old value present, throttle elapsed)
+    A->>Cache: get_or_fill(key)
+    Cache-->>A: Cold(token) — A drives the refill, old value retained
+    B->>Cache: get_or_fill(key)
+    Cache-->>B: Pending — waits on A's refill (no 2nd outcall)
+    A->>IdP: fetch
+    alt refill succeeds
+        IdP-->>A: fresh value
+        A->>Cache: publish Ok → store fresh, clear in-flight
+        Cache-->>A: FRESH value
+        Cache-->>B: FRESH value (re-check sees Fresh)
+    else refill fails
+        IdP-->>A: error
+        A->>Cache: publish Err → keep old value, set next_attempt, clear in-flight
+        Cache-->>A: STALE value
+        Cache-->>B: STALE value (re-check sees Stale)
+    end
+    Note over Cache: a later caller within the throttle → STALE (no fill);<br/>after the throttle → drives a new refill
+```
+
+**The windows on a timeline** (example values — real `ttl`/`stale` are per-cache config):
+
+```mermaid
+gantt
+    title Entry timeline after a successful fill (example ttl=3600s, stale=1800s)
+    dateFormat X
+    axisFormat %s
+    section Served value
+    FRESH — no fill                  :0, 3600
+    STALE — refill on demand (throttled) :3600, 5400
+    section Gone
+    DEAD — evicted, next call is cold :milestone, 5400, 0
+```
+
+**`get_or_fill` resolution**, at time `now`:
+
+| Entry state | Refill in flight? | Throttle (`now ≥ next_attempt`)? | Result |
+|---|---|---|---|
+| Fresh value | — | — | return Fresh value (no fill) |
+| Stale value | yes | — | **wait** (Pending), get whatever the in-flight refill resolves to |
+| Stale value | no | elapsed | drive a refill (value retained); success → Fresh, failure → Stale |
+| Stale value | no | not elapsed | return Stale value (no fill) |
+| No value | yes | — | **wait** (Pending) |
+| No value | no | elapsed | cold fill (blocking); failure → error |
+| No value | no | not elapsed | `CoolingDown` error |
+
+If a waiter exhausts the poll budget while a **stale value exists**, it falls back to that stale value rather than a timeout; a wait-timeout is reserved for a cold key whose owner is wedged.
+
+**Assumed defaults** (working assumptions — flag in §10 if you'd prefer the alternative):
+
+1. **Failure throttle.** On a failed (re)fill, `next_attempt = now + ttl` — i.e. reuse `ttl`, no separate knob. The cache never attempts a fill more than once per lifetime, success or failure; the up-to-`ttl` recovery delay is hidden by stale-serving. (Alternative: a small `retry_every` < `ttl` for faster recovery.)
+2. **Eviction over `max_entries`.** Evict the **oldest** entry — the one with the smallest `evict_at` (since `ttl`/`stale` are per-cache, `evict_at` order is fill-age order). No extra per-entry bookkeeping. (Alternative: true LRU, which better protects a hot key from a churn of one-off keys.)
+
 ### 5.3 Verification flow
 
 For SSO (`discovery_domain` provided by caller):
@@ -923,6 +1034,8 @@ A and B can land any time, in any order, after M, but before C2 they're standalo
 
 - **Cache size revisit.** Starting cap is 100 per cache (conservative); telemetry from §11 (`oidc_cache_hits_total / oidc_cache_misses_total` ratio over a 1-week window, evictions per hour) drives the decision to raise. If miss rate stays under, say, 5% we leave it; if it climbs we either raise the cap or shorten the TTL.
 - **TTL on `Pending` entries.** `PENDING_STALE_AFTER_SECS = 120 s` is comfortable for IC HTTP outcalls under normal conditions. The §11 `oidc_outcall_duration_seconds` histogram is the metric that drives revisits: if the 99p climbs near 120 s we lower the timeout or widen the stale-after window depending on which way the latency tail goes.
+- **Failure-retry throttle (§5.2.2).** Assumed: reuse `ttl` (no extra knob — never fill more than once per lifetime; up-to-`ttl` recovery hidden by stale-serving). Revisit toward a smaller `retry_every` only if recovery latency after an IdP outage proves too slow in practice.
+- **Eviction policy over `max_entries` (§5.2.2).** Assumed: evict the oldest entry (smallest `evict_at`), no extra bookkeeping. Revisit toward true LRU if the access pattern once the allowlist is lifted turns out to be a few hot SSOs amid a churn of one-off keys (LRU would stop the churn from evicting the hot ones).
 - **Residual unstamped credentials post-migration.** If PR-M misses an SSO (failing discovery at snapshot time, deployer error), credentials for that domain stay `sso_domain = None`. The metadata layer handles `None` today (renders the bare iss), so this is not a functional break — but a follow-up upgrade with a corrected `sso_credential_migration` arg can stamp the residual.
 - **`response_mode=form_post` and FedCM coexistence.** Today's `requestJWT` falls back to popup when FedCM isn't available. Form_post applies only to the popup path. If a future FedCM upgrade adds a redirect fallback we'd revisit; for now the two paths are independent.
 - **Direct provider JWKS cache behaviour.** Hardcoded providers' JWKS today is fetched eagerly at canister bring-up via `Provider::create`. Under §5 it becomes lazy on first sign-in attempt. First-after-deploy sign-in pays one cache-miss outcall — masked from the user by the `discover_sso_query` shortcut for the SSO path, but direct providers don't go through `discover_sso`, so the cold-pay hits the JWT verification call itself. Acceptable but worth flagging in the rollout notes.
