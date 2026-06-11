@@ -328,11 +328,14 @@ The `cache.jwks` lookup that follows step 2 of every flow above is identical in 
 
 Both `cache.discovery` and `cache.jwks` are instances of **one** generic primitive, `SingleFlightCache<K, V, E>` (the `single_flight_cache` module extracted in dfinity/internet-identity#3995), so dedup, freshness, stale-serving, failure backoff and eviction live in one tested place. `K` is the key, `V` the cached value, `E` the error the fill can fail with.
 
-**Callback delivery, not a return value.** The cache never hands a value back to its caller. You call `with_value(&CACHE, key, on_ready)` with a key and a callback; the callback runs **exactly once** with a `Result<V, CacheFillError<E>>`. The *fill* — the async function that produces a value for a key — is set once, when the cache is constructed.
+**Poll, not block.** `get(&CACHE, key)` answers immediately with `Cached`:
 
-This shape is forced by the IC executor. A canister call cannot block on another call's in-flight work: resuming another call's task runs it to completion *inside the current call's* context and mis-routes its reply (`ic0.msg_reply … already replied`). So instead of making callers wait, the owning fill is detached with `ic_cdk::spawn`, and every interested caller's callback fires when that one fill lands. Callers return immediately; whatever they needed the value for happens in the callback, and the outcome is observed by a later poll (the email-recovery flow already polls its status).
+- **`Ready(v)`** — a value is servable now (fresh, or the last-good value while a failed refresh backs off).
+- **`Pending`** — nothing servable yet: a fill is in flight (this call may have just spawned it), or a failed fill is within its backoff. The caller polls again; a later `get` returns `Ready` once the value lands.
 
-**One fill, many callbacks.** Concurrent requests for the same key do not each fetch. The first request starts the fill; the rest attach their callbacks to its queue. When the fill completes, every queued callback runs with the **same** result — a single outcall fan-out serves all of them.
+The cache never blocks one call on another's in-flight work, and never delivers via a callback. This shape is forced by the IC executor: a canister call cannot suspend on another call's task — resuming it runs that task *inside the current call's* context and mis-routes its reply (`ic0.msg_reply … already replied`). So the owning fill is detached with `ic_cdk::spawn`, and its only job is to fetch and store. Whoever needs the value re-issues `get` and reads it when it's `Ready` — the email-recovery status poll is exactly this. The *fill* (the async function that produces a value for a key) is set once, when the cache is constructed.
+
+**Single-flight dedup is the in-flight marker alone.** Concurrent `get`s for the same key don't each fetch: the first spawns the fill, the rest see the marker and return `Pending` — no second outcall fan-out. When the fill stores its result, the next poll from any caller reads it. There is no waiter queue and no callback fan-out to bound.
 
 **The time model — one vocabulary.** A successful fill at `filled_at` opens two windows:
 
@@ -340,9 +343,9 @@ This shape is forced by the IC executor. A canister call cannot block on another
 filled_at ──fresh_for──▶ fresh_until ──stale_for──▶ evict_at
 ```
 
-- `fresh_for` — how long a freshly filled value is authoritative; within it, every request is served the cached value with no fill.
+- `fresh_for` — how long a freshly filled value is authoritative; within it, every `get` returns the cached value with no fill.
 - `fresh_until = filled_at + fresh_for` — fresh below it, stale above.
-- `stale_for` — extra window the last good value keeps being served past `fresh_until`, as a fallback while a refresh is attempted.
+- `stale_for` — extra window the last good value can still be served past `fresh_until`, as a fallback once a refresh has failed.
 - `evict_at = fresh_until + stale_for` — hard deadline; the entry is dropped at/after it (or earlier, if evicted as least-recently-used).
 - `retry_at` — a failed fill parks the key here (exponential backoff); no new fill starts before it. Capped by `evict_at`.
 
@@ -361,27 +364,29 @@ struct Entry<V> {
 
 The failure marker shares this one map (a key that has only failed is `value: None`), so `max_entries` bounds real values **and** failure markers together — there is no separate, unbounded backoff map. A failure marker carries its own `evict_at`, so it ages out like any other entry: that is what bounds a never-succeeding key's backoff (the marker is dropped, the next request cold-fills and resets `failures`) and stops it leaking memory.
 
-**What a request resolves to.** `with_value` classifies the key and acts on it:
+**What a `get` resolves to.**
 
-- **Deliver** — a value is servable now (fresh, or stale and still inside its backoff window). The callback runs immediately with `Ok(value)`; no fill.
-- **StartFill** — nothing servable, or a refresh is due, and no fill is in flight. This caller owns a new fill: its callback joins the queue and the fill is spawned. Any stale value is kept for stale-if-error.
-- **Joining** — a fill is already in flight for this key. The callback joins that fill's queue (dedup — no second fill) and is delivered its result.
-- **Throttled** — a recent fill failed, the backoff hasn't elapsed, and there is no value to serve. The callback runs immediately with `Err(Throttled)`.
+- **Fresh value** → `Ready(v)`, no fill.
+- **Fill in flight** (a cold fetch, or a refresh over a stale value) → `Pending`. We want the fresh result, so the caller waits for it via the next poll rather than being served stale early.
+- **Refresh/refill due, none in flight** → spawn the fill, return `Pending`. Any stale value is retained for stale-if-error.
+- **Failed fill within backoff** → `Ready(stale)` if a last-good value exists (stale-if-error), else `Pending` (poll the backoff out).
+
+So the *only* time a stale value is served is **stale-if-error** — a refresh was attempted and failed, and we serve the last-good value while the backoff runs. A stale value whose refresh is merely *due* returns `Pending` and spawns the refill, so the caller polls through to the **fresh** result rather than trusting a stale one when a fresh fetch is available.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Absent
-    Absent --> Filling: first request (StartFill)
+    Absent --> Filling: first get spawns the fill
 
     state "no servable value" as NoVal {
-        Filling --> Throttled: fill fails
-        Throttled --> Filling: retry_at elapsed, next request
+        Filling --> BackingOff: fill fails
+        BackingOff --> Filling: retry_at elapsed, next get
     }
     state "has a servable value" as HasVal {
         Fresh --> Stale: fresh_until passes
-        Stale --> Refilling: retry_at elapsed, next request
+        Stale --> Refilling: refresh due, next get
         Refilling --> Fresh: fill ok
-        Refilling --> Stale: fill fails (value kept)
+        Refilling --> Stale: fill fails (value kept, backing off)
     }
 
     Filling --> Fresh: fill ok
@@ -389,9 +394,9 @@ stateDiagram-v2
     NoVal --> Absent: evict_at / LRU
 ```
 
-**Filling** and **Refilling** are the same in-flight fill; the only difference is whether a servable value already exists. While either runs, concurrent requests **Join** it. A failed refresh returns to **Stale** with the old value kept (stale-if-error); a successful one lands in **Fresh** with the value replaced. An entry leaves to **Absent** by reaching `evict_at`, or by being the least-recently-used victim when the cache is full.
+`get` returns `Ready(v)` in **Fresh**, and in **Stale** only while a failed refresh is backing off (stale-if-error). It returns `Pending` everywhere a fill is in flight (**Filling**, **Refilling**) or about to be spawned (a due refresh, a cold key), and in **BackingOff** with no value to serve. An entry leaves to **Absent** by reaching `evict_at`, or by being the least-recently-used victim when the cache is full.
 
-**Delivery and dedup on the wire** — the property we care about most: once a fill is in flight, every later request for that key joins it, and all queued callbacks receive the same result. An error reaches a callback only for a key with **no** servable value; a key that already holds a value rides a failed refresh out on the stale copy.
+**Dedup on the wire** — the property we care about most: once a fill is in flight, every later `get` for that key sees the in-flight marker and returns `Pending` without issuing a second fan-out; they all read the one fill's result on a later poll.
 
 ```mermaid
 sequenceDiagram
@@ -399,23 +404,20 @@ sequenceDiagram
     actor B
     participant Cache as SingleFlightCache
     participant IdP
-    Note over Cache: key is STALE (old value present, backoff elapsed)
-    A->>Cache: with_value(key, cbA)
-    Note over Cache: StartFill — cbA queued, fill spawned, old value kept
-    B->>Cache: with_value(key, cbB)
-    Note over Cache: Joining — cbB queued on the same fill (no 2nd outcall)
+    Note over Cache: key is cold (no value cached)
+    A->>Cache: get(key)
+    Note over Cache: miss → spawn fill (A owns it)
+    Cache-->>A: Pending
     Cache->>IdP: fetch (detached)
-    alt fill succeeds
-        IdP-->>Cache: fresh value
-        Note over Cache: store fresh, reset backoff
-        Cache-->>A: cbA(Ok(fresh))
-        Cache-->>B: cbB(Ok(fresh))
-    else fill fails
-        IdP-->>Cache: error
-        Note over Cache: keep old value, park retry_at
-        Cache-->>A: cbA(Ok(stale))
-        Cache-->>B: cbB(Ok(stale))
-    end
+    B->>Cache: get(key)
+    Note over Cache: fill in flight → no 2nd fan-out
+    Cache-->>B: Pending
+    IdP-->>Cache: value
+    Note over Cache: fill stores the value
+    A->>Cache: get(key)
+    Cache-->>A: Ready(value)
+    B->>Cache: get(key)
+    Cache-->>B: Ready(value)
 ```
 
 **The windows on a timeline** (example values — real `fresh_for`/`stale_for` are per-cache config):
@@ -426,33 +428,31 @@ gantt
     dateFormat X
     axisFormat %s
     section Served value
-    FRESH — served, no fill                     :0, 3600
-    STALE — served; refresh on demand (backoff) :3600, 5400
+    FRESH — Ready, no fill                          :0, 3600
+    STALE — refresh on demand; Ready only if backing off :3600, 5400
     section Gone
-    EVICTED — next request is a cold fill        :milestone, 5400, 0
+    EVICTED — next get is a cold fill                :milestone, 5400, 0
 ```
 
 **Resolution**, at time `now`:
 
-| Servable value | Fill in flight? | Within backoff (`now < retry_at`)? | Result |
+| Servable value | Fill in flight? | Within backoff (`now < retry_at`)? | `get` returns |
 |---|---|---|---|
-| Fresh | — | — | **Deliver** fresh, no fill |
-| Stale | yes | — | **Join** the in-flight fill |
-| Stale | no | yes | **Deliver** stale, no fill |
-| Stale | no | no | **StartFill** (value kept); callback gets fresh on success, the stale value on failure |
-| None | yes | — | **Join** the in-flight fill |
-| None | no | yes | **Throttled** — `Err(Throttled)` |
-| None | no | no | **StartFill** (cold); callback gets the value on success, `Err(FillFailed)` on failure |
+| Fresh | — | — | `Ready(v)`, no fill |
+| Stale | yes | — | `Pending` (wait for the refill's fresh result) |
+| Stale | no | yes | `Ready(v)` — stale-if-error (a recent refill failed; serve last-good) |
+| Stale | no | no | `Pending`, spawn refill (value kept for stale-if-error) |
+| None | yes | — | `Pending` (the in-flight fill, deduped) |
+| None | no | yes | `Pending` (cold failure backing off; nothing to serve) |
+| None | no | no | `Pending`, spawn cold fill |
 
-**The error a callback can see** is always one of three, and only when nothing better could be served: `FillFailed(E)` (the fill failed and there was no value to fall back on), `Throttled` (a recent failure is still inside its backoff), or `QueueFull` (below).
+**The cache never surfaces an error to callers** — `get` is `Ready`/`Pending` only. A transient fill failure simply reads as `Pending` until the backoff clears or a later fill succeeds; the caller's own deadline (e.g. the recovery challenge's 30-min TTL) bounds the wait. A *definitive* negative that should be cached and served — like DoH's "no such record" — is encoded in the value type (`V`), not as an error, so it lands as `Ready`.
 
-**Bounded waiter queues (`max_waiters`).** The callbacks queued behind one in-flight fill are capped. Past the cap a request gets `Err(QueueFull)` instead of enqueuing — a transient signal to retry past the burst. The fill still completes and caches, so the retry is served with no second fan-out. This bounds memory under a concurrency spike on one popular key.
+**Abandonment takeover (`abandon_fill_after`).** A detached fill can trap after its outcall, leaving the in-flight marker stranded — without recovery, every later `get` for that key would return `Pending` until the entry ages out. So an in-flight marker older than `abandon_fill_after` is treated as abandoned, and the next `get` takes the fill over. A `fill_id` token tags each attempt, so the stranded fill's late store (if it ever lands) is a no-op.
 
-**Abandonment takeover (`abandon_fill_after`).** A detached fill can trap after its outcall (e.g. inside a callback), leaving the in-flight marker stranded — without recovery, every later request for that key would Join a fill that never completes and hang until the entry ages out. So an in-flight marker older than `abandon_fill_after` is treated as abandoned, and the next request takes the fill over. A `fill_id` token tags each attempt: the stranded fill's late completion (if it ever arrives) is a no-op, and the queued callbacks are retained and drained by the replacement — a trapped fill never strands its waiters.
+**Trap isolation.** Each fill stores its result in its own response execution. A trap there rolls back only that fill — the value is simply re-fetched on the next poll — so one wedged fetch can't corrupt the cache or strand other keys. Fail-safe.
 
-**Trap isolation.** When a fill completes, the value is committed and the queued callbacks are drained synchronously in that one response execution. Callbacks must not trap (the backend no-trap rule already requires this); a trap during the drain rolls the whole batch back, and the value is simply re-fetched on the next request — fail-safe.
-
-**Required configuration.** Every knob lives in a `CacheConfig` that has **no `Default`**: `fresh_for`, `stale_for`, `max_entries`, `max_waiters`, `backoff`, `abandon_fill_after`. The cache fronts the subnet's shared, bounded HTTPS-outcall capacity, where a silently-defaulted protection (no backoff, no waiter cap) is an availability/abuse footgun — so the caller states each value explicitly.
+**Required configuration.** Every knob lives in a `CacheConfig` that has **no `Default`**: `fresh_for`, `stale_for`, `max_entries`, `backoff`, `abandon_fill_after`. The cache fronts the subnet's shared, bounded HTTPS-outcall capacity, where a silently-defaulted protection (no backoff) is an availability/abuse footgun — so the caller states each value explicitly.
 
 **Design choices:**
 
