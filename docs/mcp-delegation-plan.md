@@ -213,7 +213,12 @@ values). Events: `request-invalid`, `request-received`, `confirmed`,
 
 1. **Deploy-arg shape:** field name and whether to store the bare origin vs a
    full callback URL (the operator's design, point 1).
-2. **Default TTL** for these delegations (proposed 60 min).
+2. **FE default TTL.** Reuse `/cli`'s mechanism verbatim: `ttl` is a caller
+   fragment param, converted to `max_ttl` for `prepare_account_delegation`; the
+   backend already clamps to `MAX_EXPIRATION_PERIOD_NS` (30 days), so no backend
+   change. Only the FE default-when-absent is a choice: `/cli` uses 480 min
+   (8h). Match it for parity, or pick a shorter default (e.g. 60–120 min) to
+   limit how long a delegation lives on the MCP server. Decision pending.
 3. **Consent copy** naming the configured MCP server (security-sensitive).
 
 ## 13. Task breakdown
