@@ -46,6 +46,8 @@ Confirmed design decisions:
   session key and callback out of II's server-side request logs.
 - **Account:** default account only (`account_number = []`), matching `/cli`,
   which has no account selection.
+- **TTL:** FE default **60 min**; the caller may request longer via the `ttl`
+  fragment param, clamped to 30 days by the backend (`MAX_EXPIRATION_PERIOD_NS`).
 - **Scope:** the II-side `/mcp` page + the deploy arg + CSP wiring. The MCP
   server itself is a separate project.
 
@@ -55,8 +57,12 @@ Follows the existing `related_origins` / `feature_flags` path end-to-end:
 
 1. **`InternetIdentityFrontendArgs`** (`src/internet_identity_interface/.../types.rs`)
    and `InternetIdentityFrontendInit` (`internet_identity_frontend.did`): add
-   `mcp_server_origin: Option<String>` (e.g. `"https://mcp.id.ai"`, no trailing
-   slash). Regenerate the FE bindings
+   ```rust
+   /// Origin of the trusted MCP server, e.g. "https://mcp.id.ai" (no trailing
+   /// slash). When unset, the /mcp delegation flow is disabled.
+   pub mcp_server_origin: Option<String>,
+   ```
+   Mirrors the existing `backend_origin` convention. Regenerate the FE bindings
    (`$lib/generated/internet_identity_frontend_{types,idl}`).
 2. **CSP** (`internet_identity_frontend/src/main.rs#get_content_security_policy`):
    when configured, append the origin to `form-action`, so the top-level form
@@ -65,14 +71,21 @@ Follows the existing `related_origins` / `feature_flags` path end-to-end:
    `'self' http://127.0.0.1:*` plus the configured MCP origin; never `https:`.
 3. **Frontend** reads `frontendCanisterConfig.mcp_server_origin` (decoded from
    `document.body.dataset.canisterConfig` in `globals.ts#initGlobals`) to:
-   - validate the request `callback`'s origin equals the configured origin
+   - validate `new URL(callback).origin === new URL(mcp_server_origin).origin`
      (reject ⇒ invalid screen — belt-and-suspenders with the CSP), and
    - show the MCP server identity on the consent screen.
    If `mcp_server_origin` is unset, `/mcp` is effectively disabled (every
    request is invalid).
 
-*(Exact field name / whether to store full origin vs URL is part of the design
-the operator is finalising; the above is the integration shape.)*
+The config stores the **origin**, not a full callback URL: that matches the
+granularity `form-action` can actually enforce (a host-source is
+`scheme://host:port`, no path), lets the trusted MCP server choose/version its
+own callback path without an II redeploy, and keeps `/mcp` structurally parallel
+to `/cli` (which likewise takes a full `callback` and validates its shape). If
+multiple trusted MCP servers are ever needed, this generalises to
+`Option<Vec<String>>` exactly like `related_origins`, with the check becoming
+set-membership. `https` is required for the configured origin and the callback;
+`http://127.0.0.1` is accepted only under `dev_csp`.
 
 ## 3. End-to-end flow
 
@@ -141,7 +154,8 @@ New directory `src/frontend/src/routes/(new-styling)/mcp/`, mirroring `cli/`:
     origin**; allow `http://127.0.0.1` only under dev),
   - `app` (required bare hostname; reuse `/cli`'s `parseDomain`),
   - `state` (required, echoed back — the `/mcp` analogue of `/cli`'s `nonce`),
-  - `ttl` (optional; reuse `parseTtl`, lower default),
+  - `ttl` (optional; reuse `parseTtl` with a 60-min default; caller may request
+    longer, backend clamps to 30 days),
   - `status` (`success | error`) for the redirect-back load (reuse `/cli`'s
     `parseStatus`, minus `identity-mismatch`).
 - **`+page.svelte`** — phase machine `wizard | authorize | consent | success |
@@ -211,15 +225,8 @@ values). Events: `request-invalid`, `request-received`, `confirmed`,
 
 ## 12. Open questions
 
-1. **Deploy-arg shape:** field name and whether to store the bare origin vs a
-   full callback URL (the operator's design, point 1).
-2. **FE default TTL.** Reuse `/cli`'s mechanism verbatim: `ttl` is a caller
-   fragment param, converted to `max_ttl` for `prepare_account_delegation`; the
-   backend already clamps to `MAX_EXPIRATION_PERIOD_NS` (30 days), so no backend
-   change. Only the FE default-when-absent is a choice: `/cli` uses 480 min
-   (8h). Match it for parity, or pick a shorter default (e.g. 60–120 min) to
-   limit how long a delegation lives on the MCP server. Decision pending.
-3. **Consent copy** naming the configured MCP server (security-sensitive).
+1. **Consent copy** naming the configured MCP server (security-sensitive) —
+   needs review before implementation.
 
 ## 13. Task breakdown
 
