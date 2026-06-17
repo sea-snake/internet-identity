@@ -187,9 +187,7 @@ identity-switcher header shows only during `wizard`/`authorize`.
   multi-account picker** — default account only (§1). This is the per-request
   consent; shown every connection.
 - **Close / success** (`McpCloseWindowView`): success check, **"You're signed
-  in"** / **"You can close this window."** *(Screenshot shows a later variant
-  "You're connected / You can return to your MCP client" — final wording is
-  adjustable; keep it client-agnostic since the client is unknown.)*
+  in"** / **"You can close this window."**
 - **mcp-disabled** (gate not enabled): lock icon, **"MCP access not enabled"** /
   "For security, Internet Identity blocks MCP clients from signing in to apps
   using your identity." / "Enable MCP access for this device, then try again." +
@@ -262,8 +260,8 @@ values). Events: `request-invalid`, `request-received`, `confirmed`,
 
 ## 11. Open questions
 
-1. **Success-screen wording** — "You're signed in" (final JSX) vs the
-   screenshot's "You're connected"; keep client-agnostic.
+None outstanding — all design and behaviour decisions are settled. Copy follows
+the design source files (the JSX/HTML), not the screenshots, where they differ.
 
 ## 12. Task breakdown
 
