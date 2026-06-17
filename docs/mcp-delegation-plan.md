@@ -162,32 +162,25 @@ New directory `src/frontend/src/routes/(new-styling)/mcp/`, mirroring `cli/`:
   error | access-disabled | invalid`, plus the onMount `status`/fragment-clear
   logic copied from `/cli`. The `consent` phase is new vs `/cli` (which folds
   consent into Continue) because consent must name the app every request.
-- **`+layout.svelte`** — identity switcher header; factor the shared header out
-  of `cli/+layout.svelte` into a common component rather than copy-paste.
-- **`utils.ts`** — `mcpAuthorize()` (form POST to the configured callback) on
-  top of the shared chain builder (§6).
+- **`+layout.svelte`** — `/mcp`'s own identity-switcher header, following the
+  pattern in `cli/+layout.svelte`. `/cli` is left untouched.
+- **`utils.ts`** — self-contained `mcpAuthorize()`: builds the delegation chain
+  (prepare → get → sub-delegate to the MCP server's session key) and form-POSTs
+  it to the configured callback. `/mcp` and `/cli` are kept orthogonal — no
+  shared helper; each route owns its own delegation/delivery code.
 - **`mcp-access.store.ts`** — device-local gate, structurally identical to
   `cli-access.store.ts`; new `storeLocalStorageKey.McpAccess`.
 - **`views/`** — `McpConsentView`, `McpSuccessView`, `McpErrorView`,
   `McpAccessDisabledView` (+ authorize view if not folded into consent).
 
-## 6. Shared refactor
-
-`cli/utils.ts#cliAuthorize` and `mcp/utils.ts#mcpAuthorize` share the
-prepare → get → sub-delegate sequence. Extract
-`$lib/utils/delegation/buildAccountDelegationChain({ authenticated,
-targetPublicKey, effectiveOrigin, ttlNanos })`, used by both; the differences
-(loopback vs configured-origin form target) stay in each route's `utils.ts`.
-Keeps the "never sign to the supplied key" invariant in one place.
-
-## 7. Settings (device gate)
+## 6. Settings (device gate)
 
 - `McpAccessSection.svelte` + `McpConfirmDialog.svelte` under
   `manage/(authenticated)/settings/components/`, mirroring the CLI pair with
   MCP-specific warning copy. Wire next to `CliAccessSection`. Keep MCP access a
   **separate** toggle from CLI access.
 
-## 8. Backend changes
+## 7. Backend changes
 
 - **Deploy arg + CSP** as in §2 (the only required backend changes).
 - **Candid / canister methods:** none — reuse `prepare_account_delegation` /
@@ -195,14 +188,14 @@ Keeps the "never sign to the supplied key" invariant in one place.
 - **No CORS, no `.well-known`** discovery needed (top-level navigation; the MCP
   server is configured with the `/mcp` URL out of band).
 
-## 9. Analytics
+## 8. Analytics
 
 `mcpAuthorizeFunnel.ts` mirroring `cliAuthorizeFunnel.ts`, constructed
 `new Funnel("mcp-authorize", true)` (**`prefixEvents = true`**, short unprefixed
 values). Events: `request-invalid`, `request-received`, `confirmed`,
 `access-disabled`, `success`, `error`.
 
-## 10. Testing
+## 9. Testing
 
 - **E2E (Playwright):** `tests/e2e-playwright/fixtures/mcp.ts` modelled on
   `fixtures/cli.ts`; the mock MCP server receives the form POST, asserts `state`
@@ -211,36 +204,34 @@ values). Events: `request-invalid`, `request-received`, `confirmed`,
   off; invalid fragment; callback origin ≠ configured origin rejected; `status`
   redirect-back screens.
 - **Unit:** `+page.ts` validation (callback origin must equal configured origin,
-  required `app`/`state`, TTL default/cap); shared chain builder;
-  `mcp-access.store`.
+  required `app`/`state`, TTL default/cap); `mcp/utils.ts`; `mcp-access.store`.
 - **Rust:** `get_content_security_policy` assertion — configured MCP origin
   appears in `form-action`, and `form-action` is never broadened to `https:`.
 
-## 11. i18n and docs
+## 10. i18n and docs
 
 - New strings via `$t` / `<Trans>`; **do not** hand-edit `lib/locales/*.po`
   (bot-managed).
 - Document `/mcp`, the deploy arg, and the security model alongside `/cli`,
   including the explicit "no alternative-origins validation" note.
 
-## 12. Open questions
+## 11. Open questions
 
 1. **Consent copy** naming the configured MCP server (security-sensitive) —
    needs review before implementation.
 
-## 13. Task breakdown
+## 12. Task breakdown
 
 1. Add `mcp_server_origin` to `InternetIdentityFrontendArgs` + `.did`;
    regenerate FE bindings; feed it into `form-action` in
    `get_content_security_policy`; expose via `globals.ts`.
-2. Extract shared `buildAccountDelegationChain`; refactor `cli/utils.ts` onto it.
-3. `mcp-access.store.ts` + `storeLocalStorageKey.McpAccess`.
-4. `mcp/+page.ts` parsing/validation (incl. configured-origin callback check) +
+2. `mcp-access.store.ts` + `storeLocalStorageKey.McpAccess`.
+3. `mcp/+page.ts` parsing/validation (incl. configured-origin callback check) +
    unit tests.
-5. `mcp/utils.ts#mcpAuthorize` (form POST) + unit test.
-6. `mcp/+page.svelte` phase machine + views + `status` redirect-back handling.
-7. Shared layout header refactor + `mcp/+layout.svelte`.
-8. `McpAccessSection` / `McpConfirmDialog` + settings wiring.
-9. `mcpAuthorizeFunnel.ts`.
-10. E2E fixture + spec; Rust CSP assertion.
-11. Docs/spec update; run formatter + linter before commit.
+4. `mcp/utils.ts#mcpAuthorize` (build chain + form POST) + unit test.
+5. `mcp/+page.svelte` phase machine + views + `status` redirect-back handling.
+6. `mcp/+layout.svelte` (own identity-switcher header).
+7. `McpAccessSection` / `McpConfirmDialog` + settings wiring.
+8. `mcpAuthorizeFunnel.ts`.
+9. E2E fixture + spec; Rust CSP assertion.
+10. Docs/spec update; run formatter + linter before commit.
